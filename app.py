@@ -395,7 +395,8 @@ class App:
         tk.Label(body, text="  ·  ".join(([files] if res["files"] > 1 else []) + [models, boxes, pairs]), bg=CARD, fg=MUTED,
                  font=(FONT, 9), anchor="w").pack(anchor="w", pady=(self.px(2), 0))
 
-        tk.Label(body, text="Формат: " + core.KIND_NAMES[res["kind"]], bg=CARD, fg=MUTED,
+        tk.Label(body, text="Формат: " + core.KIND_NAMES[res["kind"]] + (f'  ·  {res["period"]}' if res.get("period") else ""),
+                 bg=CARD, fg=MUTED,
                  font=(FONT, 9), anchor="w").pack(anchor="w")
 
         # замечания: красным/жёлтым — то, что стоит проверить, серым — просто информация

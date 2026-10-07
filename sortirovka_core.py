@@ -7,6 +7,9 @@
 Файлы можно загружать вперемешку: каждый формат собирается в свой общий файл
 рядом с исходным: <имя>_sortirovka.xlsx
 
+Все отгрузки дополнительно раскладываются по датам (лист «По датам»), а строки
+на листах моделей идут в порядке дат.
+
 Здесь нет графики и нет pandas — только openpyxl. Так exe получается маленьким.
 """
 import re
@@ -55,6 +58,14 @@ def _find_columns(header):
     return model, sscc, size
 
 
+def _find_boxes_extra(header):
+    """Необязательные колонки формата «по коробам»: дата отгрузки и номер документа."""
+    names = [_norm(v) for v in header]
+    date = next((i for i, n in enumerate(names) if n in ("дата отгрузки", "дата")), None)
+    doc = next((i for i, n in enumerate(names) if n == "номер документа"), None)
+    return {"date": date, "doc": doc}
+
+
 def _find_schedule_cols(header):
     """Колонки формата «график поставок»: словарь поле -> номер колонки (или None)."""
     names = [_norm(v) for v in header]
@@ -93,7 +104,8 @@ def read_file(path):
             if header is not None:
                 if not rows:
                     raise SortError("В файле есть заголовки, но нет ни одной строки с данными.")
-                return {"kind": kind, "header": header, "rows": rows, "cols": cols}
+                return {"kind": kind, "header": header, "rows": rows, "cols": cols,
+                        "extra": _find_boxes_extra(header) if kind == "boxes" else None}
     finally:
         wb.close()
 
@@ -111,16 +123,20 @@ def _size_key(value):
         return (1, 0.0, str(value))
 
 
-def group_rows(rows, cols):
-    """Раскладывает строки по моделям и сортирует: короб -> размер."""
+def group_rows(rows, cols, date_idx=None):
+    """Раскладывает строки по моделям и сортирует: дата -> короб -> размер."""
     c_model, c_sscc, c_size = cols
     groups = defaultdict(list)
     for row in rows:
         model = str(row[c_model]).strip() if row[c_model] is not None else ""
         groups[model or NO_MODEL].append(row)
 
+    def date_key(row):
+        d = _to_date(row[date_idx]) if date_idx is not None else None
+        return (d is None, d or datetime.min)           # без даты — в конец
+
     for model_rows in groups.values():
-        model_rows.sort(key=lambda r: (str(r[c_sscc]), _size_key(r[c_size])))
+        model_rows.sort(key=lambda r: (date_key(r), str(r[c_sscc]), _size_key(r[c_size])))
     return dict(sorted(groups.items()))
 
 
@@ -242,15 +258,38 @@ def _process_boxes(items):
         all_rows.extend(table["rows"])
         file_stats.append((path.name, len(table["rows"])))
 
-    groups = group_rows(all_rows, cols)
+    extra = items[0][1]["extra"]
+    date_idx, doc_idx = extra["date"], extra["doc"]
+    groups = group_rows(all_rows, cols, date_idx)
     boxes, bad, incomplete = check_boxes(all_rows, cols)
+
+    # отгрузка = дата + номер документа (части одного документа объединяются)
+    ships, dates = {}, []
+    if date_idx is not None:
+        for path, table in items:
+            for row in table["rows"]:
+                d = _to_date(row[date_idx])
+                doc = str(row[doc_idx]).strip() if doc_idx is not None and row[doc_idx] is not None else ""
+                sh = ships.setdefault((d, doc), {"date": d, "name": doc, "files": set(), "sscc": set(),
+                                                 "pairs": 0, "per_model": defaultdict(int)})
+                model = str(row[cols[0]]).strip() if row[cols[0]] is not None else ""
+                sh["files"].add(path.name)
+                sh["pairs"] += 1
+                sh["per_model"][model or NO_MODEL] += 1
+                if row[cols[1]] is not None and str(row[cols[1]]).strip():
+                    sh["sscc"].add(str(row[cols[1]]).strip())
+                dates.append(d)
+        for sh in ships.values():
+            sh["boxes"] = len(sh["sscc"])
 
     wb = Workbook()
     summary_ws = wb.active
     summary_ws.title = "Сводка"
     _write_summary(summary_ws, groups, cols, file_stats)
+    if ships:
+        _write_by_date(wb.create_sheet("По датам"), list(ships.values()), list(groups), "Номер документа")
 
-    used = {"сводка"}
+    used = {"сводка", "по датам"}
     for model, model_rows in groups.items():
         ws = wb.create_sheet(_safe_sheet_name(model, used))
         ws.append([_clean(h) for h in header])
@@ -265,8 +304,11 @@ def _process_boxes(items):
         warnings.append(f"В {bad} коробах больше {ITEMS_PER_BOX} пар или смешаны разные модели — проверьте исходник")
     if incomplete:
         warnings.append(f"Неполных коробов (меньше {ITEMS_PER_BOX} пар): {incomplete}")
+    if date_idx is None:
+        warnings.append("Нет колонки «Дата отгрузки» — лист «По датам» не создан")
     return {"kind": "boxes", "files": len(items), "output": str(out), "models": len(groups),
-            "boxes": boxes, "pairs": len(all_rows), "warnings": warnings, "warn_level": "bad" if bad else "info"}
+            "boxes": boxes, "pairs": len(all_rows), "warnings": warnings, "warn_level": "bad" if bad else "info",
+            "period": _period(dates)}
 
 
 # ---------- формат 2: «график поставок» ----------
@@ -343,6 +385,32 @@ def _read_deliveries(items):
     return deliveries, lines, warnings
 
 
+def _period(dates):
+    """Список дат -> '14.08.2026 – 02.10.2026' (или одна дата, или None)."""
+    ds = sorted(d for d in dates if d)
+    if not ds:
+        return None
+    a, b = f"{ds[0]:%d.%m.%Y}", f"{ds[-1]:%d.%m.%Y}"
+    return a if a == b else f"{a} – {b}"
+
+
+def _write_by_date(ws, shipments, models, title):
+    """Лист «По датам»: отгрузки по порядку дат; в колонках — пары по каждой модели."""
+    ws.append(["Дата", title, "Файлы", "Коробов", "Пар"] + models)
+    total_boxes = total_pairs = 0
+    per_model = [0] * len(models)
+    for sh in sorted(shipments, key=lambda x: (x["date"] is None, x["date"] or datetime.min, x["name"])):
+        cells = [sh["per_model"].get(m, 0) for m in models]
+        ws.append([sh["date"], sh["name"], ", ".join(sorted(sh["files"])), sh["boxes"], sh["pairs"]] + cells)
+        ws.cell(ws.max_row, 1).number_format = "DD.MM.YYYY"
+        total_boxes += sh["boxes"]
+        total_pairs += sh["pairs"]
+        per_model = [a + b for a, b in zip(per_model, cells)]
+    ws.append(["ИТОГО", None, None, total_boxes, total_pairs] + per_model)
+    _style_sheet(ws)
+    _bold_row(ws, ws.max_row)
+
+
 def _bold_row(ws, row):
     for cell in ws[row]:
         cell.font = Font(bold=True)
@@ -367,12 +435,13 @@ def _process_schedule(items):
     wb = Workbook()
     sm = wb.active
     sm.title = "Сводка"
+    bd = wb.create_sheet("По датам")
     dl = wb.create_sheet("Поставки")
 
     # листы моделей
     model_cols = ["Поставка", "Дата", "Город", "Артикул короба", "ШК короба", "Артикул Кари",
                   "Модель", "Цена закупки", "Коробов", "Пар", "Примеч", "Файл"]
-    used = {"сводка", "поставки"}
+    used = {"сводка", "по датам", "поставки"}
     for m in models:
         ws = wb.create_sheet(_safe_sheet_name(m, used))
         ws.append(model_cols)
@@ -408,6 +477,18 @@ def _process_schedule(items):
     sm.append([])
     sm.append(["Колонки с названиями поставок (город и дата) — количество пар в этой поставке."])
 
+    # лист «По датам»: те же поставки в порядке дат, пары по каждой модели
+    ships = []
+    for d in deliveries:
+        mine = [ln for ln in lines if ln["key"] == d["key"]]
+        per_model = defaultdict(int)
+        for ln in mine:
+            per_model[ln["model"]] += ln["pairs"]
+        ships.append({"date": d["date"], "name": d["key"], "files": {d["file"]},
+                      "boxes": sum(ln["boxes"] for ln in mine), "pairs": sum(ln["pairs"] for ln in mine),
+                      "per_model": per_model})
+    _write_by_date(bd, ships, models, "Поставка")
+
     # лист «Поставки»: что заявлено в шапке файла и что получилось по моделям
     dl.append(["Поставка", "Дата", "Время", "Город", "Файл", "Пар по шапке файла",
                "Коробов по шапке файла", "Объём, куб", "Пар по моделям"])
@@ -433,7 +514,8 @@ def _process_schedule(items):
     out = output_path_for([p for p, _ in items])
     _save(wb, out)
     return {"kind": "schedule", "files": len(items), "output": str(out), "models": len(models),
-            "boxes": tot_boxes, "pairs": tot_pairs, "warnings": warnings, "warn_level": "bad"}
+            "boxes": tot_boxes, "pairs": tot_pairs, "warnings": warnings, "warn_level": "bad",
+            "period": _period(d["date"] for d in deliveries)}
 
 
 # ---------- главная функция ----------
